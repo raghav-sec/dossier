@@ -31,7 +31,7 @@ export default async function JobsPage({ searchParams }: PageProps<"/jobs">) {
     userTimeZone(),
     countPostings(),
     countSearches(),
-    isAiUsable().then(handsOffToClaude),
+    isAiUsable("scoring").then(handsOffToClaude),
   ]);
   const now = new Date();
 
@@ -43,8 +43,8 @@ export default async function JobsPage({ searchParams }: PageProps<"/jobs">) {
 
   return (
     <JobsScreen
-      source={config.source}
-      arbeitsagenturNote={config.source === "ARBEITSAGENTUR" && !config.arbeitsagentur.acceptedAt}
+      sources={config.sources}
+      arbeitsagenturNote={config.sources.includes("ARBEITSAGENTUR") && !config.arbeitsagentur.acceptedAt}
       scoreInClaude={scoreInClaude}
       // Named here: the browser's ICU can name a few countries differently from the server's.
       countries={COUNTRIES}

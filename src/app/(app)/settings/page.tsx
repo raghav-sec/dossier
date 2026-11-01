@@ -2,8 +2,10 @@ import type { Metadata } from "next";
 import { headers } from "next/headers";
 
 import { loadAiConfig, loadAiSettingsView } from "@/lib/ai/config";
-import { jobSearchView, loadJobSearchConfig } from "@/lib/job-search/config";
+import { agentSources, jobSearchView, loadJobSearchConfig } from "@/lib/job-search/config";
 import { COUNTRIES } from "@/lib/job-search/countries";
+import { loadAgentSearches } from "@/lib/agent/searches";
+import { EMPTY_QUERY } from "@/lib/job-search/search";
 import { loadSearch } from "@/lib/posting-searches";
 import { providerOption } from "@/lib/ai/provider-options";
 import { lastNightlyBackup } from "@/lib/backup-schedule";
@@ -32,6 +34,7 @@ import { DocumentsSection } from "./documents-section";
 import { GoogleSection } from "./google-section";
 import { GoogleNotice } from "./google-notice";
 import { JobSearchSection } from "./job-search-section";
+import { ScoringCriteria } from "./scoring-criteria";
 import { ScoringSection } from "./scoring-section";
 import { AboutSection, type AboutFacts, type UsagePingView } from "./about-section";
 import { ConnectorSection } from "./connector-section";
@@ -56,20 +59,29 @@ export default async function SettingsPage({ searchParams }: PageProps<"/setting
       ) : section === "jobs" ? (
         <JobSearchSection initial={jobSearchView(await loadJobSearchConfig())} />
       ) : section === "scoring" ? (
-        <ScoringSection initial={scoringView(await loadScoringConfig())} />
+        <>
+          <ScoringSection initial={scoringView(await loadScoringConfig())} />
+          <ScoringCriteria initial={settings.scoringCriteria} />
+        </>
       ) : section === "agent" ? (
         <AgentSection
           initial={{
             enabled: settings.agentEnabled,
-            // With no search of its own yet, it starts from the last one in Find jobs.
-            query: settings.agentQuery.keywords.trim() ? settings.agentQuery : ((await loadSearch())?.query ?? settings.agentQuery),
             hour: settings.agentHour,
             minScore: settings.agentMinScore,
             maxScores: settings.agentMaxScores,
             maxDrafts: settings.agentMaxDrafts,
             autoDraft: settings.agentAutoDraft,
+            maxSearches: settings.agentMaxSearches,
+            maxPages: settings.agentMaxPages,
+            startups: settings.agentStartups,
+            startupMinMatch: settings.agentStartupMinMatch,
+            budgets: settings.jobSourceBudgets,
           }}
-          source={(await loadJobSearchConfig()).source}
+          searches={await loadAgentSearches()}
+          // A new search starts from the last one in Find jobs.
+          starter={(await loadSearch())?.query ?? EMPTY_QUERY}
+          sources={agentSources(await loadJobSearchConfig())}
           scoring={await scoringReadiness()}
           countries={COUNTRIES}
           timeZone={await lastKnownTimeZone()}
@@ -105,7 +117,7 @@ export default async function SettingsPage({ searchParams }: PageProps<"/setting
         />
       ) : section === "data" ? (
         <DataSection
-          hasApiKey={[settings.apiKeyEnc, settings.jsearchKeyEnc, settings.adzunaKeyEnc].some((key) => key !== null)}
+          hasApiKey={(await prisma.aiProfile.count({ where: { apiKeyEnc: { not: null } } })) > 0 || [settings.jsearchKeyEnc, settings.jsearchRapidapiKeyEnc, settings.adzunaKeyEnc].some((key) => key !== null)}
           exportName={exportFileName()}
           backups={{
             on: settings.nightlyBackup,

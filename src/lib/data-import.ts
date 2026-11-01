@@ -2,7 +2,8 @@ import "server-only";
 
 import { Prisma, type PrismaClient } from "@/generated/prisma/client";
 import { encryptApiKey } from "@/lib/ai/api-key";
-import { EXPORT_FORMAT, EXPORT_SCHEMA_VERSION, EXPORT_SCHEMA_VERSIONS, exportSchema, INSTALL_SETTINGS, SECRET_SETTINGS, type DossierExport } from "@/lib/data-export";
+import { AiProvider } from "@/generated/prisma/enums";
+import { EXPORT_FORMAT, EXPORT_SCHEMA_VERSION, EXPORT_SCHEMA_VERSIONS, exportSchema, INSTALL_SETTINGS, LEGACY_AI_SETTINGS, SECRET_SETTINGS, type DossierExport } from "@/lib/data-export";
 import { encryptSecret, JOB_SOURCE_KEY } from "@/lib/secrets";
 
 // Restoring from an export file (E10-6, SET-10): everything is replaced in
@@ -70,6 +71,54 @@ const json = (value: unknown) => (value === null || value === undefined ? Prisma
 /** A JSON list for a column that can't be null (#222): anything else reads as empty. */
 const jsonList = (value: unknown) => (Array.isArray(value) ? value : []) as Prisma.InputJsonValue;
 
+/** The file's JSearch keys by host; before version 8 a file had one, for the host in its settings. */
+function jsearchKeysFrom({ schemaVersion, settings, jobSourceKeys }: DossierExport): Record<string, string | null> {
+  const encrypt = (key: string | undefined) => (key ? encryptSecret(JOB_SOURCE_KEY, key) : null);
+  const rapidapiOnly = schemaVersion < 8 && settings.some((entry) => entry.key === "jsearchHost" && entry.value === "rapidapi");
+  if (rapidapiOnly) return { jsearchKeyEnc: null, jsearchRapidapiKeyEnc: encrypt(jobSourceKeys?.jsearch) };
+  return { jsearchKeyEnc: encrypt(jobSourceKeys?.jsearch), jsearchRapidapiKeyEnc: encrypt(jobSourceKeys?.jsearchRapidapi) };
+}
+
+/** The settings older files hold that are now rows: the AI provider and the job agent's one search. */
+const LEGACY_SETTINGS: readonly string[] = [...LEGACY_AI_SETTINGS, "agentQuery", "jobSource"];
+
+/** The file's saved agent searches; before version 8 the one search was the agentQuery setting, kept when it has keywords. */
+function agentSearchesFrom(data: DossierExport): DossierExport["agentSearches"] {
+  if (data.schemaVersion >= 8) return data.agentSearches;
+  const value = data.settings.find((entry) => entry.key === "agentQuery")?.value;
+  let query: unknown = null;
+  try {
+    query = value ? JSON.parse(value) : null;
+  } catch {
+    return [];
+  }
+  const keywords = (query as { keywords?: unknown } | null)?.keywords;
+  if (typeof keywords !== "string" || !keywords.trim()) return [];
+  return [{ id: "agent-search-legacy", name: "", query, sources: [], enabled: true, sort: 0, createdAt: data.exportedAt, updatedAt: data.exportedAt }];
+}
+
+/** The file's chosen job sources; before version 8 one was the jobSource setting. */
+function jobSourcesFrom(data: DossierExport): { key: string; value: string }[] {
+  if (data.schemaVersion >= 8) return [];
+  const value = data.settings.find((entry) => entry.key === "jobSource")?.value;
+  if (!value) return [];
+  return [{ key: "jobSources", value: JSON.stringify(value === "OFF" ? [] : [value]) }];
+}
+
+/** The file's AI profiles; a file before version 8 has its provider in settings, which becomes the default profile. */
+function aiProfilesFrom(data: DossierExport): { aiProfiles: NonNullable<DossierExport["aiProfiles"]>; aiProfileKeys: Record<string, string>; aiDefaultProfileId: string | null } {
+  if (data.aiProfiles) return { aiProfiles: data.aiProfiles, aiProfileKeys: data.aiProfileKeys ?? {}, aiDefaultProfileId: null };
+  const setting = (key: string) => data.settings.find((entry) => entry.key === key)?.value || null;
+  const provider = setting("provider");
+  if (!provider || !(Object.values(AiProvider) as string[]).includes(provider)) return { aiProfiles: [], aiProfileKeys: {}, aiDefaultProfileId: null };
+  const id = "ai-profile-default";
+  return {
+    aiProfiles: [{ id, name: "", provider: provider as AiProvider, baseUrl: setting("baseUrl"), model: setting("model"), sort: 0, createdAt: data.exportedAt, updatedAt: data.exportedAt }],
+    aiProfileKeys: data.apiKey ? { [id]: data.apiKey } : {},
+    aiDefaultProfileId: id,
+  };
+}
+
 /**
  * Replaces all user data with the export's, in one transaction. Each saved
  * key (the AI provider's, the job sources') stays as it is unless the file
@@ -78,10 +127,11 @@ const jsonList = (value: unknown) => (Array.isArray(value) ? value : []) as Pris
  * settings (the usage ping's) stay as they are.
  */
 export async function importExport(db: PrismaClient, data: DossierExport): Promise<void> {
-  const { profile, themes, settings, applications, postings, searches, agentCandidates, startups, startupBlocks, apiKey, jobSourceKeys } = data;
+  const { profile, themes, settings, applications, postings, searches, agentCandidates, agentCandidateSearches, startups, startupBlocks, jobSourceKeys } = data;
+  const agentSearches = agentSearchesFrom(data);
+  const { aiProfiles, aiProfileKeys, aiDefaultProfileId } = aiProfilesFrom(data);
   const fromFile: Record<string, string | null> = {
-    apiKeyEnc: apiKey ? encryptApiKey(apiKey) : null,
-    jsearchKeyEnc: jobSourceKeys?.jsearch ? encryptSecret(JOB_SOURCE_KEY, jobSourceKeys.jsearch) : null,
+    ...jsearchKeysFrom(data),
     adzunaKeyEnc: jobSourceKeys?.adzuna ? encryptSecret(JOB_SOURCE_KEY, jobSourceKeys.adzuna) : null,
   };
   const keptKeys = [...SECRET_SETTINGS.filter((key) => !fromFile[key]), ...INSTALL_SETTINGS];
@@ -94,6 +144,7 @@ export async function importExport(db: PrismaClient, data: DossierExport): Promi
       await tx.posting.deleteMany();
       await tx.postingSearch.deleteMany();
       await tx.agentCandidate.deleteMany();
+      await tx.agentSearch.deleteMany();
       await tx.startup.deleteMany();
       await tx.startupBlock.deleteMany();
       // Scores of postings (#208) belong to the profile being replaced; they're left out of exports, since they can be made again.
@@ -134,7 +185,19 @@ export async function importExport(db: PrismaClient, data: DossierExport): Promi
       await tx.reference.createMany({ data: profile.references });
       await tx.fact.createMany({ data: profile.facts });
       await tx.theme.createMany({ data: themes.map((theme) => ({ ...theme, builtIn: false })) });
-      await tx.setting.createMany({ data: settings.filter((setting) => !SECRET_SETTINGS.includes(setting.key) && !INSTALL_SETTINGS.includes(setting.key)) });
+      await tx.setting.createMany({
+        data: settings.filter(
+          (setting) => !SECRET_SETTINGS.includes(setting.key) && !INSTALL_SETTINGS.includes(setting.key) && !LEGACY_SETTINGS.includes(setting.key),
+        ),
+      });
+      await tx.setting.createMany({ data: jobSourcesFrom(data) });
+      if (aiDefaultProfileId) await tx.setting.upsert({ where: { key: "aiDefaultProfileId" }, create: { key: "aiDefaultProfileId", value: aiDefaultProfileId }, update: { value: aiDefaultProfileId } });
+      // A profile's key comes from the file, else stays as saved here for the same profile.
+      const keptProfileKeys = new Map((await tx.aiProfile.findMany({ select: { id: true, apiKeyEnc: true } })).map((entry) => [entry.id, entry.apiKeyEnc]));
+      await tx.aiProfile.deleteMany();
+      await tx.aiProfile.createMany({
+        data: aiProfiles.map((entry) => ({ ...entry, apiKeyEnc: aiProfileKeys[entry.id] ? encryptApiKey(aiProfileKeys[entry.id]) : (keptProfileKeys.get(entry.id) ?? null) })),
+      });
       for (const [key, value] of Object.entries(fromFile)) if (value) await tx.setting.create({ data: { key, value } });
 
       const themeIds = new Set((await tx.theme.findMany({ select: { id: true } })).map((theme) => theme.id));
@@ -190,15 +253,13 @@ export async function importExport(db: PrismaClient, data: DossierExport): Promi
         data: postings.map((posting) => ({ ...posting, applicationId: posting.applicationId && applicationIds.has(posting.applicationId) ? posting.applicationId : null })),
       });
       await tx.postingSearch.createMany({
-        data: searches.map((search) => ({ ...search, query: (search.query ?? {}) as Prisma.InputJsonValue, postings: (search.postings ?? []) as Prisma.InputJsonValue })),
-      });
-      // The job agent's candidates (E16), so what it saw stays seen; a draft that isn't in the file leaves it unlinked.
-      await tx.agentCandidate.createMany({
-        data: agentCandidates.map((candidate) => ({
-          ...candidate,
-          reasons: json(candidate.reasons),
-          redFlags: json(candidate.redFlags),
-          applicationId: candidate.applicationId && applicationIds.has(candidate.applicationId) ? candidate.applicationId : null,
+        data: searches.map(({ source, next, sources, results, ...search }) => ({
+          ...search,
+          // A search from before version 8 asked one source.
+          sources: sources ?? (source ? [source] : []),
+          results: (results ?? (source ? [{ source, found: search.found, next: next ?? null, problem: null }] : [])) as Prisma.InputJsonValue,
+          query: (search.query ?? {}) as Prisma.InputJsonValue,
+          postings: (search.postings ?? []) as Prisma.InputJsonValue,
         })),
       });
       // Startups (#222) with what the user did with them; an application that isn't in the file leaves one unlinked.
@@ -211,6 +272,28 @@ export async function importExport(db: PrismaClient, data: DossierExport): Promi
           reasons: jsonList(startup.reasons),
           applicationId: startup.applicationId && applicationIds.has(startup.applicationId) ? startup.applicationId : null,
         })),
+      });
+      // The job agent's candidates (E16), so what it saw stays seen; a draft that isn't in the file leaves it unlinked.
+      const startupIds = new Set(startups.map((startup) => startup.id));
+      await tx.agentCandidate.createMany({
+        data: agentCandidates.map((candidate) => ({
+          ...candidate,
+          // A startup that isn't in the file leaves it unlinked.
+          startupId: candidate.startupId && startupIds.has(candidate.startupId) ? candidate.startupId : null,
+          reasons: json(candidate.reasons),
+          redFlags: json(candidate.redFlags),
+          applicationId: candidate.applicationId && applicationIds.has(candidate.applicationId) ? candidate.applicationId : null,
+        })),
+      });
+      await tx.agentSearch.createMany({ data: agentSearches.map((search) => ({ ...search, query: (search.query ?? {}) as Prisma.InputJsonValue })) });
+      // A link to a candidate that isn't in the file is left out; one to a search that isn't keeps the search's name.
+      const candidateIds = new Set(agentCandidates.map((candidate) => candidate.id));
+      const searchIds = new Set(agentSearches.map((search) => search.id));
+      await tx.agentCandidateSearch.createMany({
+        data: agentCandidateSearches
+          .filter((link) => candidateIds.has(link.candidateId))
+          .map((link) => ({ ...link, searchId: link.searchId && searchIds.has(link.searchId) ? link.searchId : null })),
+        skipDuplicates: true,
       });
       await tx.startupBlock.createMany({ data: startupBlocks, skipDuplicates: true });
     },

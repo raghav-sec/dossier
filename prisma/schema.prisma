@@ -338,6 +338,22 @@ enum Tone {
   FORMAL
 }
 
+/// A saved AI provider: kind, address, model and key. Settings name the
+/// default one and the ones used for scoring and writing (aiDefaultProfileId,
+/// aiTaskProfiles).
+model AiProfile {
+  id        String     @id @default(cuid())
+  name      String     @default("")
+  provider  AiProvider
+  baseUrl   String?
+  model     String?
+  /// Encrypted like the other keys (AI_API_KEY); never sent to the client.
+  apiKeyEnc String?
+  sort      Int        @default(0)
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+}
+
 /// App settings, one row per saved setting; a missing key means the default.
 /// The keys, their types and defaults are in src/lib/settings.ts
 /// (settingsSchema); the enums above type its values.
@@ -585,6 +601,8 @@ enum PostingSource {
   ADZUNA
   ARBEITSAGENTUR
   FREEHIRE
+  /// A startup from Startups (#222) the job agent took as a candidate; never a job source.
+  STARTUP
 }
 
 /// A posting from Find jobs that the user kept (E14-5): saved, dismissed, or
@@ -666,6 +684,8 @@ model AgentCandidate {
   reasons       Json?
   /// What gives pause, as a JSON list of strings.
   redFlags      Json?
+  /// What scored it, with the scoring criteria's tag (src/lib/scoring/criteria.ts).
+  scoredWith    String               @default("")
   status        AgentCandidateStatus @default(SCORED)
   /// Why preparing a draft failed, if it did.
   error         String?
@@ -675,12 +695,49 @@ model AgentCandidate {
   /// A hash of the link without tracking parameters, else of company, title
   /// and place: the same job from another source or a later run matches.
   dedupeKey     String               @unique
+  /// The saved searches that found it.
+  searches      AgentCandidateSearch[]
+  /// The startup it is, when it came from Startups (#222).
+  startupId     String?
+  startup       Startup?             @relation(fields: [startupId], references: [id], onDelete: SetNull)
   createdAt     DateTime             @default(now())
   updatedAt     DateTime             @updatedAt
 
   @@unique([source, externalId])
   @@index([status, score])
   @@index([createdAt])
+}
+
+/// A search the job agent runs (E16): its query, on the sources it names
+/// (none means every source the agent searches), in `sort` order.
+model AgentSearch {
+  id         String                 @id @default(cuid())
+  name       String                 @default("")
+  /// searchQuerySchema in src/lib/job-search/search.ts.
+  query      Json
+  sources    PostingSource[]
+  enabled    Boolean                @default(true)
+  sort       Int                    @default(0)
+  candidates AgentCandidateSearch[]
+  createdAt  DateTime               @default(now())
+  updatedAt  DateTime               @updatedAt
+
+  @@index([sort, createdAt])
+}
+
+/// Which saved search found a candidate. The search's name is kept, so the
+/// link still reads after the search is deleted.
+model AgentCandidateSearch {
+  id          String         @id @default(cuid())
+  candidateId String
+  candidate   AgentCandidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  searchId    String?
+  search      AgentSearch?   @relation(fields: [searchId], references: [id], onDelete: SetNull)
+  searchName  String
+  createdAt   DateTime       @default(now())
+
+  @@unique([candidateId, searchId])
+  @@index([searchId])
 }
 
 /// How well a posting fits the profile (#208): from Score in Find jobs, or
@@ -705,18 +762,19 @@ model PostingScore {
 /// A search on Find jobs, kept with what it found until the user removes it
 /// (E14-10), so going back to it costs no searches from the source's plan.
 model PostingSearch {
-  id        String        @id @default(cuid())
-  source    PostingSource
+  id        String          @id @default(cuid())
+  /// The sources asked, in order.
+  sources   PostingSource[]
   /// The search as asked (searchQuerySchema in src/lib/job-search/search.ts).
   query     Json
-  /// The postings found, in order (foundPostingSchema[]); "Show more" adds to them.
+  /// The postings found, in order (storedPostingSchema[]); "Show more" adds to them.
   postings  Json
   /// How many postings it holds, for the Past searches list.
-  found     Int           @default(0)
-  /// What to ask the source for the next page; null on the last one.
-  next      String?
-  createdAt DateTime      @default(now())
-  updatedAt DateTime      @updatedAt
+  found     Int             @default(0)
+  /// Per source: what to ask for its next page (null on its last), how many it found, and what went wrong (sourceResultSchema[]).
+  results   Json            @default("[]")
+  createdAt DateTime        @default(now())
+  updatedAt DateTime        @updatedAt
 
   @@index([createdAt])
 }
@@ -780,6 +838,8 @@ model Startup {
   /// The application started from it ("Write to them"); deleting the application keeps the startup.
   applicationId      String?       @unique
   application        Application?  @relation(fields: [applicationId], references: [id], onDelete: SetNull)
+  /// The job agent's candidates made from it.
+  candidates         AgentCandidate[]
   createdAt          DateTime      @default(now())
   updatedAt          DateTime      @updatedAt
 

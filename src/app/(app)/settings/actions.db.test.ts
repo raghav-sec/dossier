@@ -17,13 +17,19 @@ import {
   addConnectorRedirect,
   disconnectApps,
   removeConnectorRedirect,
+  addAiProfile,
+  deleteAiProfile,
   listAiModels,
+  saveAiProfileName,
   saveAiProvider,
+  saveAiTaskProfiles,
+  setDefaultAiProfile,
   saveApiKey,
   saveJobSearchDetails,
   saveJobSource,
   saveJobSourceKey,
   saveScorer,
+  saveScoringCriteria,
   saveTypesafeKey,
   setConnector,
   testAiConnection,
@@ -60,62 +66,102 @@ beforeEach(async () => {
 });
 afterAll(() => prisma().$disconnect());
 
+const profiles = () => prisma().aiProfile.findMany({ orderBy: { sort: "asc" } });
+
 describe("saveAiProvider", () => {
-  it("saves the provider, address and model (SET-1)", async () => {
-    expect(await saveAiProvider({ provider: "LOCAL", baseUrl: " http://ollama:11434 ", model: "qwen2.5:3b" })).toEqual({
-      ok: true,
-      data: { keyState: "none" },
-    });
-    expect(await settings()).toMatchObject({ provider: "LOCAL", baseUrl: "http://ollama:11434", model: "qwen2.5:3b" });
+  it("makes the first profile from the first save and makes it the default (SET-1)", async () => {
+    const result = await saveAiProvider({ profileId: null, provider: "LOCAL", baseUrl: " http://ollama:11434 ", model: "qwen2.5:3b" });
+    expect(result).toEqual({ ok: true, data: { id: expect.any(String), keyState: "none" } });
+    const [saved] = await profiles();
+    expect(saved).toMatchObject({ provider: "LOCAL", baseUrl: "http://ollama:11434", model: "qwen2.5:3b" });
+    expect((await settings()).aiDefaultProfileId).toBe(saved.id);
   });
 
   it("removes the key when the provider changes, so it never reaches another server", async () => {
-    await saveAiProvider({ provider: "ANTHROPIC", baseUrl: "https://api.anthropic.com", model: "claude-sonnet-5" });
-    await saveApiKey({ provider: "ANTHROPIC", change: { action: "set", value: "sk-ant-secret" } });
-    await saveAiProvider({ provider: "ANTHROPIC", baseUrl: "https://api.anthropic.com", model: "claude-opus-5-5" });
-    expect((await settings()).apiKeyEnc).not.toBeNull();
-    expect(await saveAiProvider({ provider: "OPENAI", baseUrl: "https://llm.example/v1", model: "" })).toMatchObject({ data: { keyState: "none" } });
-    expect(await settings()).toMatchObject({ provider: "OPENAI", model: null, apiKeyEnc: null });
+    const created = await saveAiProvider({ profileId: null, provider: "ANTHROPIC", baseUrl: "https://api.anthropic.com", model: "claude-sonnet-5" });
+    const profileId = created.ok ? created.data.id : null;
+    await saveApiKey({ profileId, provider: "ANTHROPIC", change: { action: "set", value: "sk-ant-secret" } });
+    await saveAiProvider({ profileId, provider: "ANTHROPIC", baseUrl: "https://api.anthropic.com", model: "claude-opus-5-5" });
+    expect((await profiles())[0].apiKeyEnc).not.toBeNull();
+    expect(await saveAiProvider({ profileId, provider: "OPENAI", baseUrl: "https://llm.example/v1", model: "" })).toMatchObject({ data: { keyState: "none" } });
+    expect((await profiles())[0]).toMatchObject({ provider: "OPENAI", model: null, apiKeyEnc: null });
+  });
+
+  it("refuses a profile that no longer exists", async () => {
+    expect(await saveAiProvider({ profileId: "gone", provider: "LOCAL", baseUrl: "", model: "" })).toMatchObject({ ok: false });
   });
 });
 
 describe("saveApiKey", () => {
   it("stores the key encrypted and only says that it's set", async () => {
-    await saveAiProvider({ provider: "ANTHROPIC", baseUrl: "", model: "claude-sonnet-5" });
-    const result = await saveApiKey({ provider: "ANTHROPIC", change: { action: "set", value: " sk-ant-secret " } });
-    expect(result).toEqual({ ok: true, data: { keyState: "set" } });
+    const created = await saveAiProvider({ profileId: null, provider: "ANTHROPIC", baseUrl: "", model: "claude-sonnet-5" });
+    const profileId = created.ok ? created.data.id : null;
+    const result = await saveApiKey({ profileId, provider: "ANTHROPIC", change: { action: "set", value: " sk-ant-secret " } });
+    expect(result).toEqual({ ok: true, data: { id: profileId, keyState: "set" } });
     expect(JSON.stringify(result)).not.toContain("sk-ant");
-    const { apiKeyEnc } = await settings();
+    const { apiKeyEnc } = (await profiles())[0];
     expect(apiKeyEnc).toMatch(/^v1\./);
     expect(decryptApiKey(apiKeyEnc!)).toBe("sk-ant-secret");
   });
 
-  it("saves the provider too when it only came from the environment", async () => {
-    await saveApiKey({ provider: "ANTHROPIC", change: { action: "set", value: "sk-ant" } });
-    expect(await settings()).toMatchObject({ provider: "ANTHROPIC" });
+  it("saves a profile too when the provider only came from the environment", async () => {
+    await saveApiKey({ profileId: null, provider: "ANTHROPIC", change: { action: "set", value: "sk-ant" } });
+    expect(await profiles()).toEqual([expect.objectContaining({ provider: "ANTHROPIC" })]);
   });
 
   it("removes the key only when asked", async () => {
-    await saveAiProvider({ provider: "ANTHROPIC", baseUrl: "", model: "" });
-    await saveApiKey({ provider: "ANTHROPIC", change: { action: "set", value: "sk-ant" } });
-    expect(await saveApiKey({ provider: "ANTHROPIC", change: { action: "clear" } })).toMatchObject({ data: { keyState: "none" } });
-    expect((await settings()).apiKeyEnc).toBeNull();
+    const created = await saveApiKey({ profileId: null, provider: "ANTHROPIC", change: { action: "set", value: "sk-ant" } });
+    const profileId = created.ok ? created.data.id : null;
+    expect(await saveApiKey({ profileId, provider: "ANTHROPIC", change: { action: "clear" } })).toMatchObject({ data: { keyState: "none" } });
+    expect((await profiles())[0].apiKeyEnc).toBeNull();
   });
 
   it("refuses an empty key", async () => {
-    expect(await saveApiKey({ provider: "ANTHROPIC", change: { action: "set", value: "  " } })).toMatchObject({ ok: false });
+    expect(await saveApiKey({ profileId: null, provider: "ANTHROPIC", change: { action: "set", value: "  " } })).toMatchObject({ ok: false });
+  });
+
+  it("keeps each profile's key to itself", async () => {
+    const first = await saveApiKey({ profileId: null, provider: "OPENAI", change: { action: "set", value: "sk-one" } });
+    const added = await addAiProfile({});
+    const secondId = added.ok ? added.data.id : null;
+    await saveAiProvider({ profileId: secondId, provider: "OPENAI", baseUrl: "https://other.example/v1", model: "m" });
+    await saveApiKey({ profileId: secondId, provider: "OPENAI", change: { action: "set", value: "sk-two" } });
+    const keys = Object.fromEntries((await profiles()).map((profile) => [profile.id, decryptApiKey(profile.apiKeyEnc!)]));
+    expect(keys).toEqual({ [first.ok ? first.data.id : ""]: "sk-one", [secondId!]: "sk-two" });
+  });
+});
+
+describe("AI profiles", () => {
+  it("adds, chooses per task, and deletes, falling back to the default", async () => {
+    const first = await saveAiProvider({ profileId: null, provider: "LOCAL", baseUrl: "", model: "qwen2.5:3b" });
+    const firstId = first.ok ? first.data.id : "";
+    const added = await addAiProfile({});
+    const secondId = added.ok ? added.data.id : "";
+    expect(added).toMatchObject({ ok: true, data: { view: { defaultId: firstId, profiles: [{ id: firstId }, { id: secondId }] } } });
+
+    expect(await saveAiTaskProfiles({ scoring: secondId, writing: "unknown" })).toMatchObject({ ok: true, data: { tasks: { scoring: secondId, writing: null } } });
+    expect(await setDefaultAiProfile({ profileId: secondId })).toMatchObject({ data: { defaultId: secondId } });
+
+    expect(await deleteAiProfile({ profileId: secondId })).toMatchObject({ ok: true, data: { defaultId: firstId, tasks: { scoring: null } } });
+    expect(await settings()).toMatchObject({ aiDefaultProfileId: firstId, aiTaskProfiles: {} });
+  });
+
+  it("renames a profile", async () => {
+    const created = await saveAiProvider({ profileId: null, provider: "LOCAL", baseUrl: "", model: "" });
+    await saveAiProfileName({ profileId: created.ok ? created.data.id : "", name: " Laptop " });
+    expect((await profiles())[0].name).toBe("Laptop");
   });
 });
 
 describe("testAiConnection and listAiModels", () => {
   it("time a short prompt to the saved provider and list its models (SET-2)", async () => {
-    expect(await testAiConnection({})).toEqual({ ok: true, data: { connected: true, model: "qwen2.5:3b", seconds: expect.any(Number) } });
-    expect(await listAiModels({})).toEqual({ ok: true, data: { models: ["qwen2.5:3b", "llama3.1:8b"], problem: null } });
+    expect(await testAiConnection({ profileId: null })).toEqual({ ok: true, data: { connected: true, model: "qwen2.5:3b", seconds: expect.any(Number) } });
+    expect(await listAiModels({ profileId: null })).toEqual({ ok: true, data: { models: ["qwen2.5:3b", "llama3.1:8b"], problem: null } });
   });
 
   it("report a failure in plain words", async () => {
     provider.current = new MockProvider({ model: null });
-    expect(await testAiConnection({})).toEqual({
+    expect(await testAiConnection({ profileId: null })).toEqual({
       ok: true,
       data: { connected: false, message: "Choose a model in Settings → AI provider first." },
     });
@@ -156,40 +202,43 @@ describe("addDocumentLanguage (E10-3)", () => {
 });
 
 describe("job search settings (E14-4)", () => {
-  it("saves the source, Off included, and says what the section shows", async () => {
-    expect(await saveJobSource({ source: "JSEARCH" })).toEqual({
+  it("turns sources on and off, any number of them, and says what the section shows", async () => {
+    expect(await saveJobSource({ source: "JSEARCH", on: true })).toEqual({
       ok: true,
       data: {
-        source: "JSEARCH",
-        jsearch: { host: "openwebninja", keyState: "none" },
+        sources: ["JSEARCH"],
+        jsearch: { host: "openwebninja", keyState: "none", keyStates: { openwebninja: "none", rapidapi: "none" } },
         adzuna: { appId: "", keyState: "none" },
         arbeitsagentur: { offered: true, acceptedAt: null },
         freehire: { host: "freehire.me" },
       },
     });
-    await saveJobSource({ source: "OFF" });
-    expect((await settings()).jobSource).toBe("OFF");
-    expect(await saveJobSource({ source: "LINKEDIN" as never })).toMatchObject({ ok: false });
+    await saveJobSource({ source: "FREEHIRE", on: true });
+    expect((await settings()).jobSources).toEqual(["JSEARCH", "FREEHIRE"]);
+    await saveJobSource({ source: "JSEARCH", on: false });
+    await saveJobSource({ source: "FREEHIRE", on: false });
+    expect((await settings()).jobSources).toEqual([]);
+    expect(await saveJobSource({ source: "LINKEDIN" as never, on: true })).toMatchObject({ ok: false });
   });
 
-  it("saves the Bundesagentur für Arbeit only with its note accepted (#223)", async () => {
-    expect(await saveJobSource({ source: "ARBEITSAGENTUR" })).toEqual({
+  it("turns the Bundesagentur für Arbeit on only with its note accepted (#223)", async () => {
+    expect(await saveJobSource({ source: "ARBEITSAGENTUR", on: true })).toEqual({
       ok: false,
       error: "Tick “I understand” under the note about the Bundesagentur für Arbeit first.",
     });
-    expect((await settings()).jobSource).toBeNull();
-    const saved = await saveJobSource({ source: "ARBEITSAGENTUR", accepted: true });
-    expect(saved).toMatchObject({ ok: true, data: { source: "ARBEITSAGENTUR", arbeitsagentur: { offered: true, acceptedAt: expect.any(String) } } });
-    const { jobSource, arbeitsagenturAcceptedAt } = await settings();
-    expect(jobSource).toBe("ARBEITSAGENTUR");
+    expect((await settings()).jobSources).toBeNull();
+    const saved = await saveJobSource({ source: "ARBEITSAGENTUR", on: true, accepted: true });
+    expect(saved).toMatchObject({ ok: true, data: { sources: ["ARBEITSAGENTUR"], arbeitsagentur: { offered: true, acceptedAt: expect.any(String) } } });
+    const { jobSources, arbeitsagenturAcceptedAt } = await settings();
+    expect(jobSources).toEqual(["ARBEITSAGENTUR"]);
     expect(Date.parse(arbeitsagenturAcceptedAt!)).toBeGreaterThan(Date.now() - 60_000);
-    // Once accepted, switching back needs no second tick.
-    await saveJobSource({ source: "JSEARCH" });
-    expect(await saveJobSource({ source: "ARBEITSAGENTUR" })).toMatchObject({ ok: true });
+    // Once accepted, turning it on again needs no second tick.
+    await saveJobSource({ source: "ARBEITSAGENTUR", on: false });
+    expect(await saveJobSource({ source: "ARBEITSAGENTUR", on: true })).toMatchObject({ ok: true });
   });
 
-  it("stores each source's key encrypted, keeps it when switching, and only says it's set", async () => {
-    await saveJobSource({ source: "JSEARCH" });
+  it("stores each key encrypted, JSearch's per host, and only says it's set", async () => {
+    await saveJobSource({ source: "JSEARCH", on: true });
     const result = await saveJobSourceKey({ source: "JSEARCH", change: { action: "set", value: " ak_secret " } });
     expect(result).toMatchObject({ ok: true, data: { jsearch: { keyState: "set" } } });
     expect(JSON.stringify(result)).not.toContain("ak_secret");
@@ -197,11 +246,15 @@ describe("job search settings (E14-4)", () => {
     expect(stored).not.toContain("ak_secret");
     expect(decryptSecret(JOB_SOURCE_KEY, stored)).toBe("ak_secret");
 
-    await saveJobSource({ source: "ADZUNA" });
+    const rapid = await saveJobSourceKey({ source: "JSEARCH", host: "rapidapi", change: { action: "set", value: "rk_secret" } });
+    expect(rapid).toMatchObject({ ok: true, data: { jsearch: { host: "openwebninja", keyStates: { openwebninja: "set", rapidapi: "set" } } } });
+    expect(decryptSecret(JOB_SOURCE_KEY, (await settings()).jsearchRapidapiKeyEnc!)).toBe("rk_secret");
+
+    await saveJobSource({ source: "ADZUNA", on: true });
     await saveJobSearchDetails({ adzunaAppId: " app-1 " });
     await saveJobSourceKey({ source: "ADZUNA", change: { action: "set", value: "adz" } });
-    await saveJobSource({ source: "JSEARCH" });
-    expect(await settings()).toMatchObject({ jobSource: "JSEARCH", adzunaAppId: "app-1", jsearchKeyEnc: stored });
+    await saveJobSource({ source: "ADZUNA", on: false });
+    expect(await settings()).toMatchObject({ jobSources: ["JSEARCH"], adzunaAppId: "app-1", jsearchKeyEnc: stored });
 
     await saveJobSourceKey({ source: "JSEARCH", change: { action: "clear" } });
     expect((await settings()).jsearchKeyEnc).toBeNull();
@@ -209,32 +262,56 @@ describe("job search settings (E14-4)", () => {
     expect((await settings()).adzunaAppId).toBeNull();
   });
 
-  it("saves where the JSearch key is from", async () => {
+  it("saves which JSearch host is asked first", async () => {
     expect(await saveJobSearchDetails({ jsearchHost: "rapidapi" })).toMatchObject({ ok: true, data: { jsearch: { host: "rapidapi" } } });
     expect((await settings()).jsearchHost).toBe("rapidapi");
   });
 
-  it("tests the chosen source with its key", async () => {
+  it("tests a source with its key, JSearch with one host's", async () => {
     clearJobSearchCache();
-    expect(await testJobSource({})).toEqual({ ok: true, data: { connected: false, message: "Choose a source first." } });
-
-    await saveJobSource({ source: "JSEARCH" });
-    expect(await testJobSource({})).toEqual({
+    await saveJobSource({ source: "JSEARCH", on: true });
+    expect(await testJobSource({ source: "JSEARCH" })).toEqual({
       ok: true,
       data: { connected: false, message: "Add your JSearch key in Settings → Job search first." },
     });
 
     await saveJobSourceKey({ source: "JSEARCH", change: { action: "set", value: "ak_secret" } });
     const requests = stubFetch(() => json(jsearchV2LastPage));
-    expect(await testJobSource({})).toEqual({ ok: true, data: { connected: true, seconds: expect.any(Number) } });
+    expect(await testJobSource({ source: "JSEARCH" })).toEqual({ ok: true, data: { connected: true, seconds: expect.any(Number) } });
     expect(requests[0].headers.get("x-api-key")).toBe("ak_secret");
+    expect(await testJobSource({ source: "JSEARCH", host: "rapidapi" })).toEqual({
+      ok: true,
+      data: { connected: false, message: "Add your JSearch key for RapidAPI first." },
+    });
 
     stubFetch(() => json({}, { status: 401 }));
-    expect(await testJobSource({})).toEqual({
+    expect(await testJobSource({ source: "JSEARCH" })).toEqual({
       ok: true,
       data: { connected: false, message: "JSearch didn't accept your key. Check it in Settings → Job search." },
     });
     vi.unstubAllGlobals();
+  });
+
+  it("falls back to the other JSearch host when the first refuses its key", async () => {
+    clearJobSearchCache();
+    await saveJobSource({ source: "JSEARCH", on: true });
+    await saveJobSourceKey({ source: "JSEARCH", change: { action: "set", value: "ak_spent" } });
+    await saveJobSourceKey({ source: "JSEARCH", host: "rapidapi", change: { action: "set", value: "rk_fresh" } });
+    const requests = stubFetch((request) => (request.headers.get("x-api-key") === "ak_spent" ? json({}, { status: 429 }) : json(jsearchV2LastPage)));
+    const { runSearch } = await import("@/lib/posting-searches");
+    expect(await runSearch({ keywords: "designer", place: "", country: "de", radiusKm: 25, remoteOnly: false, postedWithin: "any" })).toMatchObject({ ok: true });
+    expect(requests.map((request) => request.url.hostname)).toEqual(["api.openwebninja.com", "jsearch.p.rapidapi.com"]);
+    expect(requests[1].headers.get("x-rapidapi-key")).toBe("rk_fresh");
+    vi.unstubAllGlobals();
+  });
+});
+
+describe("scoring criteria", () => {
+  it("saves what the user wants from a job, and refuses one that's empty", async () => {
+    const criteria = [{ id: "a", label: "Salary", preference: "At least 80k EUR", importance: "MUST" as const }];
+    expect(await saveScoringCriteria({ criteria })).toEqual({ ok: true, data: criteria });
+    expect((await settings()).scoringCriteria).toEqual(criteria);
+    expect(await saveScoringCriteria({ criteria: [{ ...criteria[0], label: " " }] })).toMatchObject({ ok: false });
   });
 });
 
